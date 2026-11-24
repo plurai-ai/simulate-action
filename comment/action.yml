@@ -1,0 +1,108 @@
+name: Plurai simulation comment
+description: >-
+  Publishes the report of a `plurai-ai/simulate-action` job: the sticky PR comment and a check run that shows the report. Run
+  it in a separate job (`needs` the simulate job, `if: always()`, `permissions: pull-requests: write` and `checks: write`)
+  that never runs the agent's code: it downloads the simulate job's report artifact, edits one comment per PR, workflow and
+  job, and creates one check run per run through the Checks API.
+author: Plurai
+branding:
+  icon: message-square
+  color: blue
+
+inputs:
+  job:
+    description: >-
+      The id of the job that runs the `simulate-action` step. It names the report artifact and the sticky comment.
+    required: false
+    default: simulate
+  result:
+    description: >-
+      The simulate job's result, `needs.<job>.result` of the workflow. It words the comment of a job that left no report: a
+      cancelled run, a crash. A `skipped` job posts nothing.
+    required: false
+    default: ''
+  pr_comment:
+    description: >-
+      Post the sticky PR comment. `false` makes this step a no-op, so the comment is switched off by editing one line.
+    required: false
+    default: 'true'
+
+  test_report:
+    description: >-
+      Create the check run that shows the report. `false` makes that step a no-op. The check needs `checks: write` on the job;
+      a job without it leaves a note in the job summary and still succeeds.
+    required: false
+    default: 'true'
+  check_name:
+    description: >-
+      The name of the check run. Empty names it after the workflow, `Plurai simulation results (<agent>)` for a workflow
+      from the plugin template. Keep it stable and different from the `simulate` job's check, the one branch protection
+      requires.
+    required: false
+    default: ''
+
+outputs:
+  comment-url:
+    description: >-
+      The URL of the PR comment, empty when none was posted.
+    value: ${{ steps.post.outputs.comment_url }}
+  check-url:
+    description: >-
+      The URL of the check run, empty when none was created.
+    value: ${{ steps.check.outputs.check_url }}
+
+runs:
+  using: composite
+  steps:
+    # This job runs no project code, so `python3` on the runner's PATH is the runner's own.
+    - name: Plan the comment
+      id: plan
+      shell: bash
+      env:
+        INPUT_JOB: ${{ inputs.job }}
+        INPUT_PR_COMMENT: ${{ inputs.pr_comment }}
+        INPUT_TEST_REPORT: ${{ inputs.test_report }}
+        INPUT_CHECK_NAME: ${{ inputs.check_name }}
+        SA_RESULT: ${{ inputs.result }}
+      run: python3 -S -E "$GITHUB_ACTION_PATH/../scripts/comment_plan.py"
+
+    - name: Download the simulate job's report
+      id: download
+      if: steps.plan.outputs.comment_mode == 'on' || steps.plan.outputs.report_mode == 'on'
+      continue-on-error: true
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: ${{ steps.plan.outputs.artifact }}
+        path: ${{ runner.temp }}/plurai-report
+
+    # The step that holds the job token for the comment. It runs this action's own scripts on a runner that never ran the
+    # agent, and reads one file of the downloaded artifact as text.
+    - name: Post the PR comment
+      id: post
+      if: steps.plan.outputs.comment_mode == 'on'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        SA_COMMENT_MODE: ${{ steps.plan.outputs.comment_mode }}
+        SA_PR_NUMBER: ${{ steps.plan.outputs.pr_number }}
+        SA_HEAD_SHA: ${{ steps.plan.outputs.head_sha }}
+        SA_WORKFLOW_KEY: ${{ steps.plan.outputs.workflow_key }}
+        SA_REPORT_DIR: ${{ runner.temp }}/plurai-report
+        SA_RESULT: ${{ inputs.result }}
+      run: python3 -S -E "$GITHUB_ACTION_PATH/../scripts/comment.py"
+
+    # Creates the check run that shows the report. It holds the job token like the comment step, runs this action's own
+    # script, and reads one file of the downloaded artifact as text. A fork or Dependabot PR (the plan says `skip`), a token
+    # without `checks: write` and a run that left no report each end it with a note and no check; it never fails the job.
+    # It runs after a failed download too: a missing report artifact is the "no report" case the script words.
+    - name: Create the test report check
+      id: check
+      if: steps.plan.outputs.report_mode == 'on'
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        SA_REPORT_MODE: ${{ steps.plan.outputs.report_mode }}
+        SA_CHECK_NAME: ${{ steps.plan.outputs.check_name }}
+        SA_HEAD_SHA: ${{ steps.plan.outputs.head_sha }}
+        SA_REPORT_DIR: ${{ runner.temp }}/plurai-report
+      run: python3 -S -E "$GITHUB_ACTION_PATH/../scripts/check_run.py"

@@ -1,0 +1,50 @@
+# Runs the action the way a customer does, by `owner/repo@ref`, and asserts that `github.action_ref` reaches `plurai ci run`
+# as `PLURAI_ACTION_VERSION`. The fixture workflow runs the action as `uses: ./`, where the ref is empty, so only this job
+# covers the positive case. The stub `plurai` records the environment it starts with; no secret and no backend is involved.
+#
+# `uses:` takes no expression, so the ref is the literal `main`, in `uses:`, in `ACTION_REF` and in the push trigger. The job
+# does not run on pull requests: `owner/repo@ref` fetches the ref, not the PR's head, so it would test `main` instead of the
+# change.
+name: action-ref
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: plurai-action-ref-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  action-ref:
+    runs-on: ubuntu-latest
+    env:
+      ACTION_REF: main
+      URL: https://stub.plurai.invalid
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Put the stub plurai on PATH
+        run: echo "$GITHUB_WORKSPACE/tests/stub" >> "$GITHUB_PATH"
+      - name: Run the action by name and ref
+        id: sim
+        uses: plurai-ai/simulate-action@main
+        with:
+          workdir: fixture/agent/plurai_sim
+          url: ${{ env.URL }}
+          token: stub-token
+        env:
+          PLURAI_ACTION_SKIP_INSTALL: '1'
+          PLURAI_CI_OUT_DIR: ${{ runner.temp }}/plurai-ci
+          # A job-supplied version must not win over the ref the runner reports.
+          PLURAI_ACTION_VERSION: set-by-the-job
+      - name: PLURAI_ACTION_VERSION is the ref after the @
+        env:
+          OUTCOME: ${{ steps.sim.outcome }}
+          OUT_DIR: ${{ runner.temp }}/plurai-ci
+        run: |
+          python3 tests/assert_run.py --out-dir "$OUT_DIR" --outcome "$OUTCOME" --expect-exit 0 --heading ✅ \
+            --event "$GITHUB_EVENT_NAME" --repo "$GITHUB_REPOSITORY" --url "$URL" \
+            --expect-action-version "$ACTION_REF"

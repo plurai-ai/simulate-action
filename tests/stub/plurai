@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+"""A stand-in for ``plurai ci run``: records how it was started and writes the documents the real command writes.
+
+Not the SDK. The real command is not built yet, so the action's tests and its fixture workflow run against this
+executable. It exits with ``STUB_PLURAI_EXIT`` (default 0) and writes into ``PLURAI_CI_OUT_DIR``:
+
+- ``stub-record.json``: argv, working directory, pid and the environment (secret-looking values are masked), which
+  includes ``PLURAI_ACTION_VERSION`` as the action sets it
+- ``run.json``, ``summary.md``, ``comment.md``, ``report.md``, ``junit.xml`` and ``transcripts/``
+- ``suite-diff.md`` and ``suite-diff-comment.md`` when ``STUB_PLURAI_SUITE_DIFF=1``, before the wait
+- with ``STUB_PLURAI_WAIT=<seconds>`` it waits for a signal first, and records the one it got in ``stub-signal``
+"""
+
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+HEADINGS = {
+    0: '✅ 0 failed · 0 unstable · 0 advisory · 0 not measured',
+    1: '❌ 2 failed · 0 unstable · 0 advisory · 0 not measured',
+    10: '⛔ upgrade required: the backend refuses this SDK version',
+    20: '⛔ not measured: infra',
+    65: '⛔ refused',
+    77: '⛔ token rejected',
+}
+MASKED = ('TOKEN', 'KEY', 'SECRET', 'PASSWORD')
+
+#: The shape the SDK writes: a suite per scenario, a case per policy, a failure with the judge's reason.
+JUNIT_PASSED = """<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="plurai simulation" tests="1" failures="0" errors="0" skipped="0">
+  <testsuite name="refund_flow" tests="1" failures="0" errors="0" skipped="0">
+    <testcase classname="refund_flow" name="no_refund_over_limit" />
+  </testsuite>
+</testsuites>
+"""
+JUNIT_FAILED = """<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="plurai simulation" tests="2" failures="1" errors="0" skipped="0">
+  <testsuite name="refund_flow" tests="2" failures="1" errors="0" skipped="0">
+    <testcase classname="refund_flow" name="no_refund_over_limit">
+      <failure message="failed 2 of 3 trials&#10;The agent refunded 900 on turn 3, over the 500 limit.">The agent refunded 900 on turn 3, over the 500 limit.</failure>
+    </testcase>
+    <testcase classname="refund_flow" name="greets_the_customer" />
+  </testsuite>
+</testsuites>
+"""
+
+
+def main() -> int:
+    out = Path(os.environ['PLURAI_CI_OUT_DIR'])
+    out.mkdir(parents=True, exist_ok=True)
+    code = int(os.environ.get('STUB_PLURAI_EXIT', '0'))
+    argv = sys.argv[1:]
+
+    environment = {name: ('<set>' if any(word in name for word in MASKED) else value) for name, value in os.environ.items()}
+    record = {'argv': argv, 'cwd': os.getcwd(), 'pid': os.getpid(), 'exit': code, 'env': environment}
+    if '--main-run' in argv:
+        main_run = Path(argv[argv.index('--main-run') + 1])
+        record['main_run_content'] = main_run.read_text() if main_run.exists() else None
+    (out / 'stub-record.json').write_text(json.dumps(record, indent=2, sort_keys=True))
+
+    if os.environ.get('STUB_PLURAI_SUITE_DIFF') == '1':
+        (out / 'suite-diff.md').write_text('### Suite changed vs base\n\n- evals 91c2… → a7d0…\n  - stub change\n')
+        (out / 'suite-diff-comment.md').write_text('### Suite changed vs base\n\n- evals 91c2… → a7d0… (full diff: suite-diff.md)\n')
+
+    wait = float(os.environ.get('STUB_PLURAI_WAIT', '0'))
+    if wait:
+        def on_signal(signum, _frame):
+            (out / 'stub-signal').write_text(signal.Signals(signum).name)
+            raise SystemExit(130)
+
+        signal.signal(signal.SIGINT, on_signal)
+        signal.signal(signal.SIGTERM, on_signal)
+        (out / 'stub-waiting').write_text(str(os.getpid()))
+        time.sleep(wait)
+
+    heading = f'## Plurai simulation · {HEADINGS[code]}'
+    (out / 'summary.md').write_text(f'{heading}\n\nStub results.\n')
+    (out / 'comment.md').write_text(f'<!-- plurai-simulation-report -->\n{heading}\n\nStub results.\n')
+    (out / 'report.md').write_text(f'{heading}\n\nStub report.\n')
+    if code not in (10, 65):
+        (out / 'run.json').write_text(json.dumps({'schema': 'plurai-run/1', 'stub': True, 'exit': code}))
+        (out / 'junit.xml').write_text(JUNIT_FAILED if code == 1 else JUNIT_PASSED)
+        (out / 'transcripts').mkdir(exist_ok=True)
+        (out / 'transcripts' / 'scenario-1.json').write_text('{"stub": true}')
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main())

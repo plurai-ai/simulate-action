@@ -1,0 +1,4 @@
+# The fixture project's simulation directory. The stub `plurai` reads none of it; it exists so the action runs from a
+# realistic working directory.
+agent:
+  env: []

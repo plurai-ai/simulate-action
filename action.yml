@@ -1,0 +1,212 @@
+name: Plurai simulation
+description: Run a Plurai agent simulation in CI with `plurai ci run` and publish the report as the job summary and artifacts. The `comment` sub-action posts the PR comment from a separate job.
+author: Plurai
+branding:
+  icon: check-circle
+  color: blue
+
+inputs:
+  workdir:
+    description: >-
+      The agent's `plurai_sim/` directory, relative to the workspace. `plurai ci run` runs from here.
+    required: false
+    default: '.'
+  url:
+    description: >-
+      The Plurai backend URL, for a non-production backend only. Empty runs against production, which is what a customer repository wants.
+    required: false
+    default: ''
+  token:
+    description: >-
+      A Plurai service-account key (the template passes the secret `PLURAI_TOKEN`). Empty on a fork PR, where the run ends as "not measured: no secrets" (exit 20).
+    required: false
+    default: ''
+  selection:
+    description: >-
+      `smoke` or `full`. Honoured on `workflow_dispatch` only, where empty means `smoke`; the action maps every other event itself (`pull_request` and `merge_group` to smoke, `push` and `schedule` to full).
+    required: false
+    default: ''
+  include_content:
+    description: >-
+      Transcripts, judge text and the suite diff body on GitHub. `auto` follows the repository visibility (included for a private repository only), `true` or `false` force it.
+    required: false
+    default: 'auto'
+  retention_days:
+    description: >-
+      Days GitHub keeps the transcripts artifact (1 to 90). `run.json` and the reports keep the repository's retention.
+    required: false
+    default: '7'
+
+outputs:
+  out-dir:
+    description: >-
+      The directory `plurai ci run` wrote its files into.
+    value: ${{ steps.plan.outputs.out_dir }}
+  selection:
+    description: >-
+      The selection the run used, `smoke` or `full`.
+    value: ${{ steps.plan.outputs.selection }}
+  base:
+    description: >-
+      The base commit passed as `--base`, empty when none could be derived.
+    value: ${{ steps.fetch.outputs.base }}
+  main-run:
+    description: >-
+      The path of main's run.json passed as `--main-run`, empty when none was found.
+    value: ${{ steps.fetch.outputs.main_run }}
+  summary-path:
+    description: >-
+      The job summary the action wrote, as a file.
+    value: ${{ steps.plan.outputs.out_dir }}/job-summary.md
+  sdk-version:
+    description: >-
+      The SDK version the run uses: the project's own when it is in range, else the pin the action installed.
+    value: ${{ steps.install.outputs.sdk_version }}
+
+runs:
+  using: composite
+  steps:
+    - name: Plan the run
+      id: plan
+      shell: bash
+      env:
+        INPUT_URL: ${{ inputs.url }}
+        INPUT_SELECTION: ${{ inputs.selection }}
+        INPUT_INCLUDE_CONTENT: ${{ inputs.include_content }}
+        INPUT_RETENTION_DAYS: ${{ inputs.retention_days }}
+        # Empty outside a matrix; the plan refuses a job that is one of several legs.
+        SA_JOB_TOTAL: ${{ strategy.job-total }}
+        SA_JOB_INDEX: ${{ strategy.job-index }}
+      run: python3 -S -E "$GITHUB_ACTION_PATH/scripts/plan.py"
+
+    - name: Check the managed block of the workflow
+      shell: bash
+      env:
+        PLURAI_CI_OUT_DIR: ${{ steps.plan.outputs.out_dir }}
+        SA_PYTHON: ${{ steps.plan.outputs.python }}
+        ACTIONS_ID_TOKEN_REQUEST_URL: ''
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+      run: '"$SA_PYTHON" -S -E "$GITHUB_ACTION_PATH/scripts/rev_check.py"'
+
+    # The job's token is read-only (`contents: read`, `actions: read`) and lives in this step alone. `plurai ci run` never
+    # gets it. The step runs after the caller's own install steps, so the project's code has already run on this runner:
+    # the interpreter is the runner's own (the plan refuses one inside the workspace), runs with `-S -E`, and git runs with
+    # the checkout's config overridden and without the token in its environment.
+    - name: Fetch main's run and the base commit
+      id: fetch
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        PLURAI_CI_OUT_DIR: ${{ steps.plan.outputs.out_dir }}
+        SA_BASE_STRATEGY: ${{ steps.plan.outputs.base_strategy }}
+        SA_BASE: ${{ steps.plan.outputs.base }}
+        SA_PR_BASE_SHA: ${{ steps.plan.outputs.pr_base_sha }}
+        SA_PR_HEAD_SHA: ${{ steps.plan.outputs.pr_head_sha }}
+        SA_WORKFLOW_KEY: ${{ steps.plan.outputs.workflow_key }}
+        SA_DEFAULT_BRANCH: ${{ steps.plan.outputs.default_branch }}
+        SA_MAIN_BRANCH: ${{ steps.plan.outputs.main_branch }}
+        SA_VISIBILITY: ${{ steps.plan.outputs.visibility }}
+        SA_INCLUDE_CONTENT_SETTING: ${{ steps.plan.outputs.include_content_setting }}
+        SA_PYTHON: ${{ steps.plan.outputs.python }}
+        SA_GIT: ${{ steps.plan.outputs.git }}
+        ACTIONS_ID_TOKEN_REQUEST_URL: ''
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+      run: '"$SA_PYTHON" -S -E "$GITHUB_ACTION_PATH/scripts/fetch_context.py"'
+
+    - name: Check the project's SDK, or install the pin
+      id: install
+      shell: bash
+      env:
+        PLURAI_CI_OUT_DIR: ${{ steps.plan.outputs.out_dir }}
+        SA_WORKDIR: ${{ inputs.workdir }}
+        SA_PYTHON: ${{ steps.plan.outputs.python }}
+        SA_UV: ${{ steps.plan.outputs.uv }}
+        ACTIONS_ID_TOKEN_REQUEST_URL: ''
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+      run: '"$SA_PYTHON" -S -E "$GITHUB_ACTION_PATH/scripts/install_sdk.py"'
+
+    - name: Run plurai ci run
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.workdir }}
+      env:
+        PLURAI_CI_OUT_DIR: ${{ steps.plan.outputs.out_dir }}
+        SA_REPO: ${{ github.repository }}
+        # The ref the caller wrote after `@` (`v1`, a tag or a sha); empty when the action runs from the local checkout.
+        SA_ACTION_REF: ${{ github.action_ref }}
+        SA_SELECTION: ${{ steps.plan.outputs.selection }}
+        SA_BASE: ${{ steps.fetch.outputs.base }}
+        SA_MAIN_RUN: ${{ steps.fetch.outputs.main_run }}
+        SA_VISIBILITY: ${{ steps.fetch.outputs.visibility }}
+        SA_INCLUDE_CONTENT_SETTING: ${{ steps.plan.outputs.include_content_setting }}
+        SA_BIN_DIR: ${{ steps.install.outputs.bin_dir }}
+        SA_URL: ${{ inputs.url }}
+        SA_TOKEN: ${{ inputs.token }}
+        SA_PYTHON: ${{ steps.plan.outputs.python }}
+        # A caller that grants `id-token: write` to the job for its own steps makes the runner offer an OIDC token request to
+        # every step; no step of the action offers it, so the agent's code cannot request one.
+        ACTIONS_ID_TOKEN_REQUEST_URL: ''
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+      # No timeout-minutes here: the caller's job bounds the run until the scenario duration is measured.
+      # exec, so the runner's cancel signal reaches the command and its exit code is the step's.
+      run: 'exec "$SA_PYTHON" -S -E "$GITHUB_ACTION_PATH/scripts/launch.py"'
+
+    # Every step below runs after the agent's code and holds no credential: it writes files and uploads them. The PR
+    # comment is posted by the `comment` sub-action in a separate job.
+    - name: Compose the comment body for the report job
+      if: always()
+      shell: bash
+      env:
+        PLURAI_CI_OUT_DIR: ${{ steps.plan.outputs.out_dir }}
+        SA_RUN_OUTCOME: ${{ steps.run.outcome }}
+        SA_PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        SA_FETCH_OUTCOME: ${{ steps.fetch.outcome }}
+        SA_INSTALL_OUTCOME: ${{ steps.install.outcome }}
+        SA_PYTHON: ${{ steps.plan.outputs.python }}
+        ACTIONS_ID_TOKEN_REQUEST_URL: ''
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+      run: '"$SA_PYTHON" -S -E "$GITHUB_ACTION_PATH/scripts/summary.py" comment'
+
+    - name: Write the job summary
+      if: always()
+      shell: bash
+      env:
+        PLURAI_CI_OUT_DIR: ${{ steps.plan.outputs.out_dir }}
+        SA_RUN_OUTCOME: ${{ steps.run.outcome }}
+        SA_PLAN_OUTCOME: ${{ steps.plan.outcome }}
+        SA_FETCH_OUTCOME: ${{ steps.fetch.outcome }}
+        SA_INSTALL_OUTCOME: ${{ steps.install.outcome }}
+        SA_PYTHON: ${{ steps.plan.outputs.python }}
+        ACTIONS_ID_TOKEN_REQUEST_URL: ''
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+      run: '"$SA_PYTHON" -S -E "$GITHUB_ACTION_PATH/scripts/summary.py" summary'
+
+    - name: Upload run.json and the reports
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: plurai-${{ steps.plan.outputs.workflow_key }}-report
+        path: |
+          ${{ steps.plan.outputs.out_dir }}/run.json
+          ${{ steps.plan.outputs.out_dir }}/report.md
+          ${{ steps.plan.outputs.out_dir }}/junit.xml
+          ${{ steps.plan.outputs.out_dir }}/suite-diff.md
+          ${{ steps.plan.outputs.out_dir }}/comment-final.md
+        if-no-files-found: ignore
+        overwrite: true
+      env:
+        ACTIONS_ID_TOKEN_REQUEST_URL: ''
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''
+
+    - name: Upload transcripts
+      if: always() && steps.fetch.outputs.include_content == 'true'
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: plurai-${{ steps.plan.outputs.workflow_key }}-transcripts
+        path: ${{ steps.plan.outputs.out_dir }}/transcripts/
+        retention-days: ${{ steps.plan.outputs.retention_days }}
+        if-no-files-found: ignore
+        overwrite: true
+      env:
+        ACTIONS_ID_TOKEN_REQUEST_URL: ''
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: ''

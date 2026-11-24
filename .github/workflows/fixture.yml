@@ -1,0 +1,248 @@
+# Runs the action against the stub `plurai` on a fixture project, on every action PR. It proves the command line per
+# trigger, the exit-code paths, the summary heading, the artifacts after a failed run and the credential hygiene.
+# The triggers and concurrency groups are those of the workflow the plugin renders for a customer.
+name: fixture
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main, 'feature/**']
+  schedule:
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      selection:
+        type: choice
+        options: [smoke, full]
+        default: smoke
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('plurai-fixture-pr-{0}', github.event.pull_request.number) || github.event_name == 'push' && format('plurai-fixture-main-{0}', github.sha) || github.event_name == 'merge_group' && format('plurai-fixture-mq-{0}', github.event.merge_group.head_sha) || format('plurai-fixture-{0}', github.event_name) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - run: uv run --group dev ruff check .
+      - run: uv run --group dev ruff format --check .
+      - run: uv run --group dev pytest -q
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.7 -color
+
+  # The customer's shape: their own install block, then the action.
+  customer-style:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # --- user-owned: install your agent's dependencies ---
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - run: uv sync --directory fixture/agent
+      # --- end user-owned ---
+      - uses: ./.github/actions/expect
+        with:
+          heading: ✅
+          dispatch_selection: ${{ inputs.selection }}
+          expect_selection: ${{ github.event_name == 'workflow_dispatch' && inputs.selection || '' }}
+          expect_bin_dir: ${{ github.workspace }}/fixture/agent/.venv/bin
+
+  exit-0:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/expect
+        with: { code: '0', heading: ✅ }
+
+  exit-1:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/expect
+        with: { code: '1', heading: ❌ 2 failed }
+
+  exit-10:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/expect
+        with: { code: '10', heading: '⛔ upgrade required' }
+
+  exit-20:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/expect
+        with: { code: '20', heading: '⛔ not measured' }
+
+  exit-65:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/expect
+        with: { code: '65', heading: '⛔ refused' }
+
+  exit-77:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/expect
+        with: { code: '77', heading: '⛔ token rejected' }
+
+  # A matrix leg is refused by the action itself, before the stub runs: every leg would write the same artifact and the same
+  # sticky comment. Both legs must end as refused, and neither may reach `plurai ci run`.
+  matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: [one, two]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/expect
+        with: { code: '65', heading: '⛔ refused: the job is one of 2 matrix legs', stub: 'false' }
+
+  # An empty url is production: the run proceeds and `plurai ci run` sees no `PLURAI_URL`.
+  no-url:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/expect
+        with: { code: '0', heading: ✅, url: '' }
+
+  # Transcripts follow include_content: auto means private repositories only.
+  transcripts-auto:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/expect
+        with:
+          code: '1'
+          heading: ❌
+          expect_transcripts: ${{ github.event.repository.visibility == 'private' && 'present' || 'absent' }}
+
+  transcripts-off:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/expect
+        with: { code: '1', heading: ❌, include_content: 'false', expect_transcripts: absent }
+
+  transcripts-on:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/expect
+        with: { code: '1', heading: ❌, include_content: 'true', expect_transcripts: present }
+
+  # The template's two-job shape. The `pr-comment` job runs the agent with a read-only token; the `pr-comment-report` job
+  # never runs the agent and holds `pull-requests: write` and `checks: write`. It posts from the simulate job's artifact,
+  # then posts again to show the second post edits the first comment, and creates the check run that shows the report. A customer's report job has no checkout: it names the sub-action
+  # by `plurai-ai/simulate-action/comment@v1`. The fixture checks out only to reach the local action.
+  pr-comment:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/expect
+        with: { code: '1', heading: ❌ 2 failed }
+
+  pr-comment-report:
+    needs: pr-comment
+    if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./comment
+        with:
+          job: pr-comment
+          result: ${{ needs.pr-comment.result }}
+      - uses: ./comment
+        with:
+          job: pr-comment
+          result: ${{ needs.pr-comment.result }}
+          test_report: 'false'
+      - name: One check run, red, holding the report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/check-runs" --jq \
+            '[.check_runs[] | select(.name == "Plurai simulation results (fixture)")]' |
+            python3 tests/assert_check.py --conclusion failure --title '❌ 2 failed · 0 unstable · 0 advisory · 0 not measured' --contains 'Stub report.'
+      - name: One comment, holding the run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments" |
+            python3 tests/assert_comment.py --key fixture-pr-comment --count 1 --contains '❌ 2 failed'
+
+  no-comment:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/expect
+        with: { code: '0', heading: ✅ }
+
+  no-comment-report:
+    needs: no-comment
+    if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./comment
+        with:
+          job: no-comment
+          result: ${{ needs.no-comment.result }}
+          pr_comment: 'false'
+          test_report: 'false'
+      - name: No comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/issues/${{ github.event.pull_request.number }}/comments" |
+            python3 tests/assert_comment.py --key fixture-no-comment --count 0

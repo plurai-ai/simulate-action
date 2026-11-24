@@ -1,0 +1,9 @@
+[project]
+name = "fixture-agent"
+version = "0.0.0"
+description = "A project with no dependencies: the fixture workflow's user-owned install block builds its venv."
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv]
+package = false

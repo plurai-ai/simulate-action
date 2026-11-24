@@ -1,0 +1,6 @@
+env: default
+smoke: []
+trials: 3
+fail_on:
+  tags: [catastrophic, failing, regression]
+overrides: []

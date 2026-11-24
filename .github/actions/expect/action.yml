@@ -1,0 +1,111 @@
+name: Run the action against the stub and assert
+description: >-
+  Test helper for the fixture workflow. Puts the stub `plurai` on PATH, runs the action in this checkout with the stub's
+  exit code, then asserts the job result, the summary heading, the artifacts and the stub's recorded command and environment.
+inputs:
+  code:
+    description: The exit code the stub chooses.
+    required: false
+    default: '0'
+  heading:
+    description: Text the first line of the job summary must contain.
+    required: true
+  url:
+    description: The `url` input of the action. Empty runs against production, so the command must not see `PLURAI_URL`.
+    required: false
+    default: https://stub.plurai.invalid
+  include_content:
+    description: The `include_content` input of the action.
+    required: false
+    default: auto
+  expect_transcripts:
+    description: present, absent or skip.
+    required: false
+    default: skip
+  expect_selection:
+    description: Overrides the selection the event maps to.
+    required: false
+    default: ''
+  dispatch_selection:
+    description: The `selection` input of the action.
+    required: false
+    default: ''
+  stub:
+    description: Whether the stub plurai must have run (false for a refusal by the action itself).
+    required: false
+    default: 'true'
+  expect_bin_dir:
+    description: The project venv's bin directory that must lead the command's PATH.
+    required: false
+    default: ''
+runs:
+  using: composite
+  steps:
+    - name: Put the stub plurai on PATH
+      shell: bash
+      run: echo "$GITHUB_WORKSPACE/tests/stub" >> "$GITHUB_PATH"
+
+    - name: Run the action
+      id: sim
+      uses: ./
+      continue-on-error: true
+      with:
+        workdir: fixture/agent/plurai_sim
+        url: ${{ inputs.url }}
+        token: stub-token
+        selection: ${{ inputs.dispatch_selection }}
+        include_content: ${{ inputs.include_content }}
+      env:
+        STUB_PLURAI_EXIT: ${{ inputs.code }}
+        STUB_PLURAI_SUITE_DIFF: '1'
+        PLURAI_ACTION_SKIP_INSTALL: '1'
+        PLURAI_CI_OUT_DIR: ${{ runner.temp }}/plurai-ci
+        # A hostile job environment: the action must keep this out of `plurai ci run`.
+        GITHUB_TOKEN: ${{ github.token }}
+        # A job-supplied version must not reach `plurai ci run`; the fixture asserts it is unset (a local `uses: ./` has no ref).
+        PLURAI_ACTION_VERSION: set-by-the-job
+
+    # The artifacts API can answer 404 for an artifact that was finalized a moment ago, so a download that is expected to find
+    # its artifact is tried a few times before it is called missing.
+    - name: Download what the action uploaded
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPORT: plurai-fixture-${{ github.job }}-report
+        TRANSCRIPTS: plurai-fixture-${{ github.job }}-transcripts
+        EXPECT_REPORT: ${{ inputs.stub }}
+        EXPECT_TRANSCRIPTS: ${{ inputs.expect_transcripts }}
+      run: |
+        download() { # name, directory, attempts
+          for ((attempt = 1; attempt <= $3; attempt++)); do
+            gh run download "$GITHUB_RUN_ID" --name "$1" --dir "$2" && return 0
+            [ "$attempt" -lt "$3" ] && sleep 3
+          done
+          return 1
+        }
+        rm -rf "$RUNNER_TEMP/dl"
+        mkdir -p "$RUNNER_TEMP/dl/report" "$RUNNER_TEMP/dl/transcripts"
+        attempts() { [ "$1" = "$2" ] && echo 5 || echo 1; }
+        download "$REPORT" "$RUNNER_TEMP/dl/report" "$(attempts "$EXPECT_REPORT" true)" || echo "no report artifact"
+        download "$TRANSCRIPTS" "$RUNNER_TEMP/dl/transcripts" "$(attempts "$EXPECT_TRANSCRIPTS" present)" || echo "no transcripts artifact"
+
+    - name: Assert
+      shell: bash
+      env:
+        OUTCOME: ${{ steps.sim.outcome }}
+        CODE: ${{ inputs.code }}
+        HEADING: ${{ inputs.heading }}
+        URL: ${{ inputs.url }}
+        EXPECT_TRANSCRIPTS: ${{ inputs.expect_transcripts }}
+        EXPECT_SELECTION: ${{ inputs.expect_selection }}
+        EXPECT_BIN_DIR: ${{ inputs.expect_bin_dir }}
+        STUB: ${{ inputs.stub }}
+        OUT_DIR: ${{ runner.temp }}/plurai-ci
+      run: |
+        args=(--out-dir "$OUT_DIR" --outcome "$OUTCOME" --expect-exit "$CODE" --heading "$HEADING"
+          --event "$GITHUB_EVENT_NAME" --repo "$GITHUB_REPOSITORY" --url "$URL"
+          --transcripts-dir "$RUNNER_TEMP/dl/transcripts" --expect-transcripts "$EXPECT_TRANSCRIPTS")
+        [ -n "$EXPECT_SELECTION" ] && args+=(--expect-selection "$EXPECT_SELECTION")
+        [ -n "$EXPECT_BIN_DIR" ] && args+=(--expect-bin-dir "$EXPECT_BIN_DIR")
+        if [ "$STUB" = true ]; then args+=(--report-dir "$RUNNER_TEMP/dl/report"); else args+=(--no-stub); fi
+        python3 "$GITHUB_WORKSPACE/tests/assert_run.py" "${args[@]}"
